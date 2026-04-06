@@ -48,3 +48,7 @@ To calculate your annualised return, create a `cash_flows.json` file listing all
 ```
 
 Use positive amounts for deposits and negative for withdrawals.
+
+---
+
+*Developed with assistance from [Claude](https://claude.ai)*
