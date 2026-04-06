@@ -1,0 +1,24 @@
+# Portfolio reports (may contain sensitive data)
+Portfolio_*.pdf
+*.pdf
+Portfolio_*.csv
+
+# Personal data
+cash_flows.json
+isin_ticker_map.json
+
+# Generated chart outputs
+portfolio_charts.png
+portfolio_correlation.png
+portfolio_correlation_expanded.png
+portfolio_picker.png
+Figure_*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Tooling
+.claude/
