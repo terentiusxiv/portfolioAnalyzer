@@ -552,6 +552,12 @@ def compute_expanded_corr(candidates, corr_data):
     dropped = set(raw.columns) - set(valid_candidates)
     if dropped:
         print(f"   Insufficient data for: {', '.join(str(d) for d in dropped)}")
+
+    already_held = [c for c in valid_candidates if c in corr_data["returns"].columns]
+    if already_held:
+        print(f"   Already in portfolio, skipping: {', '.join(already_held)}")
+    valid_candidates = [c for c in valid_candidates if c not in corr_data["returns"].columns]
+
     if not valid_candidates:
         return None
 
