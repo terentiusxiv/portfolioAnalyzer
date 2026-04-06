@@ -651,6 +651,8 @@ def pick_stocks(candidates, corr_data, enriched, test_weight=0.05):
         valid_existing = [t for t in existing_tickers if t in combined.columns]
         pair_corrs = {t: combined[ticker].corr(combined[t]) for t in valid_existing}
         avg_corr = float(np.mean(list(pair_corrs.values())))
+        max_corr_ticker = max(pair_corrs, key=pair_corrs.get)
+        max_corr = float(pair_corrs[max_corr_ticker])
 
         sim_cov = combined[valid_existing + [ticker]].cov() * 252
         total_w = sum(corr_data["weights"][existing_tickers.index(t)] for t in valid_existing)
@@ -670,15 +672,16 @@ def pick_stocks(candidates, corr_data, enriched, test_weight=0.05):
 
         results.append({
             "ticker": ticker, "name": name, "sector": sector,
-            "avg_corr": avg_corr, "pair_corrs": pair_corrs,
-            "sim_vol": sim_vol, "vol_delta": (sim_vol - corr_data["port_vol"]) * 100,
+            "avg_corr": avg_corr, "max_corr": max_corr, "max_corr_ticker": max_corr_ticker,
+            "pair_corrs": pair_corrs, "sim_vol": sim_vol,
+            "vol_delta": (sim_vol - corr_data["port_vol"]) * 100,
         })
 
     if not results:
         print("No valid candidates to compare.")
         return expanded_data
 
-    results.sort(key=lambda x: x["avg_corr"])
+    results.sort(key=lambda x: x["max_corr"])
     print_stock_pick_report(results, corr_data, test_weight)
     return expanded_data
 
@@ -690,19 +693,19 @@ def print_stock_pick_report(results, corr_data, test_weight):
           f"(existing holdings scaled to {(1-test_weight)*100:.0f}%)")
     print("=" * 70)
     print(f"  Current portfolio volatility: {corr_data['port_vol']*100:.1f}%\n")
-    print(f"  {'Rank':<5} {'Ticker':<10} {'Sector':<22} {'Avg Corr':>9} {'Sim Vol':>8} {'Vol Δ':>8}  Verdict")
-    print(f"  {'-'*5} {'-'*10} {'-'*22} {'-'*9} {'-'*8} {'-'*8}  {'-'*12}")
+    print(f"  {'Rank':<5} {'Ticker':<10} {'Sector':<22} {'Avg Corr':>9} {'Max Corr':>9} {'Sim Vol':>8} {'Vol Δ':>8}  Verdict")
+    print(f"  {'-'*5} {'-'*10} {'-'*22} {'-'*9} {'-'*9} {'-'*8} {'-'*8}  {'-'*23}")
 
     for rank, r in enumerate(results, 1):
-        if r["avg_corr"] < 0.3:
+        if r["max_corr"] < 0.5:
             verdict = "GOOD FIT"
-        elif r["avg_corr"] < 0.6:
-            verdict = "NEUTRAL"
+        elif r["max_corr"] < 0.75:
+            verdict = f"NEUTRAL vs {r['max_corr_ticker']}"
         else:
-            verdict = "HIGH OVERLAP"
+            verdict = f"HIGH OVERLAP vs {r['max_corr_ticker']}"
         delta_str = f"{r['vol_delta']:+.1f}%"
         print(f"  {rank:<5} {r['ticker']:<10} {r['sector'][:22]:<22} "
-              f"{r['avg_corr']:>9.2f} {r['sim_vol']*100:>7.1f}% {delta_str:>8}  {verdict}")
+              f"{r['avg_corr']:>9.2f} {r['max_corr']:>9.2f} {r['sim_vol']*100:>7.1f}% {delta_str:>8}  {verdict}")
 
     print()
     for r in results:
