@@ -22,6 +22,12 @@ python portfolio_analyzer.py Portfolio_report.pdf --pick NVDA TSM ASML
 
 # Change the simulated allocation weight for candidates (default: 5%)
 python portfolio_analyzer.py Portfolio_report.pdf --pick NVDA --test-weight 0.10
+
+# Use a custom date range for correlation and price history
+python portfolio_analyzer.py Portfolio_report.pdf --start 2023-01-01 --end 2024-01-01
+
+# Custom start date, end defaults to today
+python portfolio_analyzer.py Portfolio_report.pdf --start 2022-06-01
 ```
 
 ## Supported input formats
@@ -52,7 +58,15 @@ Cash,CASH,EUR,0,0,0,0,3500.00
 
 ## First run
 
-If the script encounters a stock it cannot identify, it will prompt you to enter the Yahoo Finance ticker interactively. Tickers are saved to `isin_ticker_map.json` so you only need to do this once. Use the `.HE` suffix for Helsinki-listed stocks (e.g. `NOKIA.HE`).
+If the script encounters a stock it cannot identify, it queries the [OpenFIGI](https://www.openfigi.com/) API and suggests a Yahoo Finance ticker automatically:
+
+```
+  Apple Inc (US0378331005)
+  Suggestion: AAPL
+  Accept [Enter], override with ticker, or '-' to skip:
+```
+
+Press **Enter** to accept the suggestion, type a different ticker to override, or type `-` to skip. Tickers are saved to `isin_ticker_map.json` so you are only prompted once per ISIN. If OpenFIGI returns no result, you are prompted to type the ticker manually (e.g. `NOKIA.HE` for Helsinki-listed stocks).
 
 ## Output
 
