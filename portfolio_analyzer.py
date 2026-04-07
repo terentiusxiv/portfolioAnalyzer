@@ -23,6 +23,8 @@ import matplotlib.ticker as mticker
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from collections import defaultdict
+import urllib.request
+import urllib.error
 
 ISIN_TICKER_MAP_FILE = "isin_ticker_map.json"
 CASH_FLOWS_FILE = "cash_flows.json"
@@ -243,14 +245,71 @@ def save_isin_map(mapping):
         json.dump(mapping, f, indent=2)
 
 
+_ISIN_PREFIX_TO_EXCHCODES = {
+    "US": {"UN", "UQ", "UA", "UR", "US"},
+    "FI": {"HE"},
+    "NL": {"AS"},
+    "DE": {"GY", "DE"},
+    "DK": {"DC", "CO"},
+    "SE": {"SS", "ST"},
+    "NO": {"OL"},
+    "CH": {"SW"},
+    "GB": {"LN", "L"},
+    "JP": {"JT", "T"},
+    "CA": {"CT", "TO"},
+    "KR": {"KS"},
+}
+
+_EXCHCODE_TO_YF_SUFFIX = {
+    "HE": ".HE", "AS": ".AS", "GY": ".DE", "DE": ".DE",
+    "DC": ".CO", "CO": ".CO", "SS": ".ST", "ST": ".ST",
+    "OL": ".OL", "SW": ".SW", "LN": ".L",  "L":  ".L",
+    "CT": ".TO", "TO": ".TO", "JT": ".T",  "T":  ".T",
+    "KS": ".KS",
+    "UN": "", "UQ": "", "UA": "", "UR": "", "US": "",
+}
+
+
+def _fetch_openfigi_ticker(isin: str, timeout: int = 4) -> str | None:
+    """Query OpenFIGI for a Yahoo Finance ticker suggestion for the given ISIN."""
+    try:
+        body = json.dumps([{"idType": "ID_ISIN", "idValue": isin}]).encode()
+        req = urllib.request.Request(
+            "https://api.openfigi.com/v3/mapping",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read())
+        records = result[0].get("data", [])
+        if not records:
+            return None
+        stocks = [r for r in records if r.get("securityType2") == "Common Stock"] or records
+        isin_prefix = isin[:2]
+        preferred = _ISIN_PREFIX_TO_EXCHCODES.get(isin_prefix, set())
+        match = next((r for r in stocks if r.get("exchCode") in preferred), stocks[0])
+        ticker = match.get("ticker", "")
+        suffix = _EXCHCODE_TO_YF_SUFFIX.get(match.get("exchCode", ""), "")
+        return (ticker + suffix) if ticker else None
+    except Exception:
+        return None
+
+
 def resolve_tickers(positions, isin_map):
     updated = dict(isin_map)
     unmapped = [(p["instrument"], p["isin"]) for p in positions if p["isin"] not in updated]
     if unmapped:
         print("--- Unmapped ISINs ---")
-        print("Enter Yahoo Finance tickers (.HE for Helsinki).\n")
+        print("Suggestions from OpenFIGI shown where available.")
+        print("Press Enter to accept, type to override, or leave blank to skip.\n")
         for name, isin in unmapped:
-            ticker = input(f"  {name} ({isin}) -> ").strip()
+            suggestion = _fetch_openfigi_ticker(isin)
+            if suggestion:
+                prompt = f"  {name} ({isin})\n  Suggestion: {suggestion}\n  Accept [Enter] or override (blank to skip): "
+            else:
+                prompt = f"  {name} ({isin}) -> "
+            user_input = input(prompt).strip()
+            ticker = user_input if user_input else suggestion
             if ticker:
                 updated[isin] = ticker
         save_isin_map(updated)
