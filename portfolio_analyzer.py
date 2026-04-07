@@ -301,15 +301,18 @@ def resolve_tickers(positions, isin_map):
     if unmapped:
         print("--- Unmapped ISINs ---")
         print("Suggestions from OpenFIGI shown where available.")
-        print("Press Enter to accept, type to override, or leave blank to skip.\n")
+        print("Press Enter to accept a suggestion, type to override, or leave blank to skip.\n")
         for name, isin in unmapped:
             suggestion = _fetch_openfigi_ticker(isin)
             if suggestion:
-                prompt = f"  {name} ({isin})\n  Suggestion: {suggestion}\n  Accept [Enter] or override (blank to skip): "
+                prompt = f"  {name} ({isin})\n  Suggestion: {suggestion}\n  Accept [Enter], override with ticker, or '-' to skip: "
             else:
                 prompt = f"  {name} ({isin}) -> "
             user_input = input(prompt).strip()
-            ticker = user_input if user_input else suggestion
+            if suggestion:
+                ticker = None if user_input == "-" else (user_input or suggestion)
+            else:
+                ticker = user_input or None
             if ticker:
                 updated[isin] = ticker
         save_isin_map(updated)
@@ -389,13 +392,11 @@ def calculate_xirr(cash_flows_file, current_value):
         return None
 
 
-def compute_correlation_matrix(enriched):
+def compute_correlation_matrix(enriched, start_date, end_date):
     tickers = [p["ticker"] for p in enriched]
     if len(tickers) < 2:
         return None
-    end_date = date.today()
-    start_date = end_date - timedelta(days=365)
-    print("Fetching trailing 12-month price history...")
+    print(f"Fetching price history {start_date} \u2192 {end_date}...")
     try:
         prices = yf.download(
             tickers, start=start_date.isoformat(), end=end_date.isoformat(),
@@ -437,6 +438,7 @@ def compute_correlation_matrix(enriched):
         "corr_matrix": corr_matrix, "cov_matrix": cov_matrix, "ann_vol": ann_vol,
         "returns": returns, "tickers": ordered_tickers, "weights": w,
         "port_vol": port_vol, "pct_ctr": pct_ctr, "trading_days": trading_days,
+        "start_date": start_date, "end_date": end_date,
     }
 
 
@@ -474,7 +476,9 @@ def print_correlation_report(corr_data):
     tickers = corr_data["tickers"]
     w = corr_data["weights"]
     pct_ctr = corr_data["pct_ctr"]
-    print("  CORRELATION MATRIX (trailing 12m daily log returns)")
+    start_date = corr_data["start_date"]
+    end_date = corr_data["end_date"]
+    print(f"  CORRELATION MATRIX ({start_date} \u2192 {end_date}, daily log returns)")
     print("-" * 70)
     header = "            " + "".join(f"{t:>10}" for t in tickers)
     print(header)
@@ -553,7 +557,8 @@ def generate_correlation_charts(corr_data):
     n = len(tickers)
     fig, axes = plt.subplots(1, 2, figsize=(16, 7), facecolor="white",
                               gridspec_kw={"width_ratios": [1.2, 1], "wspace": 0.35})
-    fig.suptitle(f"Correlation & Risk  -  trailing 12m  ({corr_data['trading_days']} days)",
+    date_label = f"{corr_data['start_date']} \u2192 {corr_data['end_date']}"
+    fig.suptitle(f"Correlation & Risk  \u2014  {date_label}  ({corr_data['trading_days']} days)",
                  fontsize=14, fontweight="bold", y=0.97)
     ax1 = axes[0]
     im = ax1.imshow(corr.values, cmap=plt.cm.RdYlGn_r, vmin=-1, vmax=1, aspect="equal")
@@ -588,10 +593,8 @@ def generate_correlation_charts(corr_data):
     print(f"   Correlation charts saved to {CORRELATION_CHARTS_FILE}")
 
 
-def compute_expanded_corr(candidates, corr_data):
+def compute_expanded_corr(candidates, corr_data, start_date, end_date):
     """Download candidate price history and build a combined correlation dataset."""
-    end_date = date.today()
-    start_date = end_date - timedelta(days=365)
     print(f"Fetching price history for candidates: {', '.join(candidates)}...")
     try:
         raw = yf.download(
@@ -637,6 +640,8 @@ def compute_expanded_corr(candidates, corr_data):
         "trading_days": combined.shape[0],
         "weights": corr_data["weights"],
         "port_vol": corr_data["port_vol"],
+        "start_date": start_date,
+        "end_date": end_date,
     }
 
 
@@ -650,8 +655,9 @@ def generate_expanded_correlation_chart(expanded_data):
 
     fig, axes = plt.subplots(1, 2, figsize=(max(16, n * 1.3), 7), facecolor="white",
                              gridspec_kw={"width_ratios": [1.4, 1], "wspace": 0.40})
+    date_label = f"{expanded_data['start_date']} \u2192 {expanded_data['end_date']}"
     fig.suptitle(
-        f"Expanded Correlation  —  existing + candidates  ({expanded_data['trading_days']} days)",
+        f"Expanded Correlation  \u2014  existing + candidates  \u2014  {date_label}  ({expanded_data['trading_days']} days)",
         fontsize=14, fontweight="bold", y=0.97,
     )
 
@@ -695,9 +701,9 @@ def generate_expanded_correlation_chart(expanded_data):
     print(f"   Expanded correlation chart saved to {EXPANDED_CORRELATION_FILE}")
 
 
-def pick_stocks(candidates, corr_data, enriched, test_weight=0.05):
+def pick_stocks(candidates, corr_data, enriched, test_weight=0.05, start_date=None, end_date=None):
     """Compare candidate tickers against existing portfolio for diversification."""
-    expanded_data = compute_expanded_corr(candidates, corr_data)
+    expanded_data = compute_expanded_corr(candidates, corr_data, start_date, end_date)
     if not expanded_data:
         print("No valid candidates to compare.")
         return None
@@ -791,7 +797,33 @@ def main():
                         help="Candidate ticker(s) to evaluate for diversification")
     parser.add_argument("--test-weight", type=float, default=0.05, metavar="W",
                         help="Simulated allocation for each candidate (default: 0.05)")
+    parser.add_argument("--start", metavar="YYYY-MM-DD",
+                        help="Start date for price history (default: 1 year before --end)")
+    parser.add_argument("--end", metavar="YYYY-MM-DD",
+                        help="End date for price history (default: today)")
     args = parser.parse_args()
+
+    if args.end:
+        try:
+            end_date = date.fromisoformat(args.end)
+        except ValueError:
+            print(f"Invalid --end date: {args.end!r}. Use YYYY-MM-DD.")
+            sys.exit(1)
+    else:
+        end_date = date.today()
+
+    if args.start:
+        try:
+            start_date = date.fromisoformat(args.start)
+        except ValueError:
+            print(f"Invalid --start date: {args.start!r}. Use YYYY-MM-DD.")
+            sys.exit(1)
+    else:
+        start_date = end_date - timedelta(days=365)
+
+    if start_date >= end_date:
+        print(f"--start ({start_date}) must be before --end ({end_date}).")
+        sys.exit(1)
 
     if args.report:
         input_path = args.report
@@ -820,7 +852,7 @@ def main():
     allocation = analyze_allocation(enriched, holdings["cash_eur"])
     xirr = calculate_xirr(CASH_FLOWS_FILE, holdings["account_value_eur"])
 
-    corr_data = compute_correlation_matrix(enriched)
+    corr_data = compute_correlation_matrix(enriched, start_date, end_date)
 
     print_report(enriched, allocation, xirr)
     if corr_data:
@@ -835,7 +867,8 @@ def main():
             print("Cannot run stock picker: correlation matrix unavailable "
                   "(need >= 2 positions with sufficient history).")
             sys.exit(1)
-        expanded_data = pick_stocks(args.pick, corr_data, enriched, test_weight=args.test_weight)
+        expanded_data = pick_stocks(args.pick, corr_data, enriched, test_weight=args.test_weight,
+                                    start_date=start_date, end_date=end_date)
         if expanded_data:
             generate_expanded_correlation_chart(expanded_data)
 
