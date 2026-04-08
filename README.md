@@ -30,8 +30,6 @@ python portfolio_analyzer.py Portfolio_report.pdf --start 2023-01-01 --end 2024-
 python portfolio_analyzer.py Portfolio_report.pdf --start 2022-06-01
 ```
 
-<img width="2013" height="1037" alt="portfolio_correlation" src="https://github.com/user-attachments/assets/d74c16af-1806-4444-a078-960c63ee9670" />
-
 ## Supported input formats
 
 **Saxo Bank / Mandatum Trader PDF** — detected automatically from the file content.
