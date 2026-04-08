@@ -10,22 +10,23 @@ Usage:
   python portfolio_analyzer.py                       (auto-detects Portfolio_*.pdf/csv)
 """
 
-from abc import ABC, abstractmethod
-import yfinance as yf
+import argparse
 import json
 import re
 import sys
-import argparse
-import numpy as np
-import pandas as pd
+import urllib.error
+import urllib.request
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import numpy as np
+import pandas as pd
+import yfinance as yf
 from matplotlib.patches import Patch
-from pathlib import Path
-from datetime import datetime, date, timedelta
-from collections import defaultdict
-import urllib.request
-import urllib.error
 
 try:
     import pdfplumber
@@ -456,7 +457,7 @@ def calculate_xirr(cash_flows_file, current_value):
         return sum(a / (1 + r) ** t for a, t in zip(amounts, years))
     try:
         return brentq(npv, -0.99, 10.0)
-    except:
+    except Exception:
         return None
 
 
