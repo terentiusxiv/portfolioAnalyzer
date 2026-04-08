@@ -20,11 +20,22 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from matplotlib.patches import Patch
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from collections import defaultdict
 import urllib.request
 import urllib.error
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
 
 ISIN_TICKER_MAP_FILE = "isin_ticker_map.json"
 CASH_FLOWS_FILE = "cash_flows.json"
@@ -70,7 +81,6 @@ class SaxoParser(PortfolioParser):
         if Path(path).suffix.lower() != ".pdf":
             return False
         try:
-            import pdfplumber
             with pdfplumber.open(path) as pdf:
                 text = (pdf.pages[0].extract_text() or "").lower()
             return "saxo" in text or "mandatum" in text
@@ -78,9 +88,7 @@ class SaxoParser(PortfolioParser):
             return True  # Accept any PDF as a fallback
 
     def parse(self, path: str) -> dict:
-        try:
-            import pdfplumber
-        except ImportError:
+        if pdfplumber is None:
             print("pdfplumber not installed. Run: pip install pdfplumber")
             sys.exit(1)
 
@@ -227,7 +235,6 @@ class NordeaXlsxParser(PortfolioParser):
         if Path(path).suffix.lower() != ".xlsx":
             return False
         try:
-            import openpyxl
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
             if "Holdings" not in wb.sheetnames:
                 return False
@@ -238,9 +245,7 @@ class NordeaXlsxParser(PortfolioParser):
             return False
 
     def parse(self, path: str) -> dict:
-        try:
-            import openpyxl
-        except ImportError:
+        if openpyxl is None:
             print("openpyxl not installed. Run: pip install openpyxl")
             sys.exit(1)
 
@@ -579,7 +584,7 @@ def generate_charts(enriched, allocation):
     ax1.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"EUR {x:,.0f}"))
     ax1.spines[["top", "right"]].set_visible(False)
     ax1.set_xlim(0, max(values) * 1.30)
-    from matplotlib.patches import Patch
+
     ax1.legend(handles=[Patch(color="#16a34a", label="P/L >= 0"), Patch(color="#dc2626", label="P/L < 0")],
                loc="lower right", fontsize=8)
 
@@ -755,7 +760,7 @@ def generate_expanded_correlation_chart(expanded_data):
     ax2.set_ylabel("Annualised Volatility (%)", fontsize=9)
     ax2.set_title("Individual Volatility", fontsize=11, fontweight="bold", pad=12)
     ax2.spines[["top", "right"]].set_visible(False)
-    from matplotlib.patches import Patch
+
     ax2.legend(handles=[Patch(color="#2563eb", label="Existing holding"),
                         Patch(color="#ea580c", label="Candidate")],
                fontsize=8, loc="upper right")
