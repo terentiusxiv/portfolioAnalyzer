@@ -459,30 +459,114 @@ def _fetch_openfigi_ticker(isin: str, timeout: int = 4) -> str | None:
         return None
 
 
+# Preferred Yahoo Finance exchange codes for name-based ticker selection.
+# Primary sort key is still the search score; this list breaks ties in favour of
+# liquid, EUR-friendly exchanges over peripheral or non-EUR venues (e.g. Swiss CHF).
+_YF_EXCHANGE_PREFERENCE = [
+    "NMS", "NYQ", "NCM", "NGM",   # US — NASDAQ / NYSE variants
+    "HEL",                          # Helsinki
+    "GER", "FRA",                   # Frankfurt / XETRA
+    "AMS",                          # Amsterdam
+    "MIL",                          # Milan
+    "PAR",                          # Paris
+    "STO",                          # Stockholm
+    "CPH",                          # Copenhagen
+    "OSL",                          # Oslo
+    "ISE",                          # Ireland
+]
+
+
+def _search_yf_ticker(name: str) -> tuple[str | None, str | None]:
+    """Search Yahoo Finance by instrument name.
+
+    Returns (symbol, exchange_label) for the best-scoring equity/ETF/fund result,
+    or (None, None) if nothing was found.  The symbol already contains the correct
+    Yahoo Finance exchange suffix (e.g. 'SIILI.HE', 'NVDA'), so no further mapping
+    is needed.
+
+    When multiple results share the same score, the entry whose exchange appears
+    earliest in _YF_EXCHANGE_PREFERENCE wins, avoiding peripheral (e.g. CHF-listed)
+    cross-listings for EUR-based portfolios.
+    """
+    def _exchange_rank(r: dict) -> int:
+        try:
+            return _YF_EXCHANGE_PREFERENCE.index(r.get("exchange", ""))
+        except ValueError:
+            return len(_YF_EXCHANGE_PREFERENCE)   # unlisted exchanges go last
+
+    try:
+        results = yf.Search(name, max_results=8).quotes
+        if not results:
+            return None, None
+        candidates = [
+            r for r in results
+            if r.get("quoteType") in ("EQUITY", "ETF", "MUTUALFUND")
+        ] or results
+        best = min(candidates, key=lambda r: (-r.get("score", 0), _exchange_rank(r)))
+        label = best.get("exchDisp") or best.get("exchange") or ""
+        return best.get("symbol"), label
+    except Exception:
+        return None, None
+
+
 def resolve_tickers(positions, isin_map):
     updated = dict(isin_map)
-    unmapped = [(p["instrument"], p["isin"]) for p in positions if p["isin"] not in updated]
-    if unmapped:
+
+    def _map_key(p):
+        return p["isin"] if p["isin"] else f"NAME:{p['instrument']}"
+
+    unmapped = [(p["instrument"], _map_key(p)) for p in positions if _map_key(p) not in updated]
+    if not unmapped:
+        if not Path(ISIN_TICKER_MAP_FILE).exists():
+            save_isin_map(updated)
+        return updated
+
+    # ── Name-based positions (no ISIN): auto-resolve via Yahoo Finance search ──
+    name_based = [(n, k) for n, k in unmapped if k.startswith("NAME:")]
+    isin_based  = [(n, k) for n, k in unmapped if not k.startswith("NAME:")]
+
+    if name_based:
+        print(f"Auto-resolving {len(name_based)} name-based positions via Yahoo Finance...")
+        unresolved = []
+        for name, map_key in name_based:
+            symbol, exch = _search_yf_ticker(name)
+            if symbol:
+                updated[map_key] = symbol
+                print(f"   {name:<48} → {symbol:<12} ({exch})")
+            else:
+                unresolved.append((name, map_key))
+        print()
+
+        if unresolved:
+            print("Could not auto-resolve — enter ticker or '-' to skip:")
+            for name, map_key in unresolved:
+                user_input = input(f"  {name} -> ").strip()
+                if user_input and user_input != "-":
+                    updated[map_key] = user_input
+            print()
+
+    # ── ISIN-based positions: interactive flow with OpenFIGI suggestions ──
+    if isin_based:
         print("--- Unmapped ISINs ---")
         print("Suggestions from OpenFIGI shown where available.")
-        print("Press Enter to accept a suggestion, type to override, or leave blank to skip.\n")
-        for name, isin in unmapped:
-            suggestion = _fetch_openfigi_ticker(isin)
+        print("Press Enter to accept, type to override, or '-' to skip.\n")
+        for name, map_key in isin_based:
+            suggestion = _fetch_openfigi_ticker(map_key)
             if suggestion:
-                prompt = f"  {name} ({isin})\n  Suggestion: {suggestion}\n  Accept [Enter], override with ticker, or '-' to skip: "
+                prompt = f"  {name} ({map_key})\n  Suggestion: {suggestion}\n  Accept [Enter], override, or '-' to skip: "
             else:
-                prompt = f"  {name} ({isin}) -> "
+                prompt = f"  {name} ({map_key}) -> "
             user_input = input(prompt).strip()
             if suggestion:
                 ticker = None if user_input == "-" else (user_input or suggestion)
             else:
                 ticker = user_input or None
             if ticker:
-                updated[isin] = ticker
-        save_isin_map(updated)
-        print(f"\n   Saved to {ISIN_TICKER_MAP_FILE}\n")
-    elif not Path(ISIN_TICKER_MAP_FILE).exists():
-        save_isin_map(updated)
+                updated[map_key] = ticker
+        print()
+
+    save_isin_map(updated)
+    print(f"   Saved to {ISIN_TICKER_MAP_FILE}\n")
     return updated
 
 
@@ -490,7 +574,8 @@ def enrich_positions(positions, isin_map):
     print("Fetching data from Yahoo Finance...")
     enriched = []
     for pos in positions:
-        ticker = isin_map.get(pos["isin"])
+        map_key = pos["isin"] if pos["isin"] else f"NAME:{pos['instrument']}"
+        ticker = isin_map.get(map_key)
         if not ticker:
             continue
         try:
@@ -580,13 +665,28 @@ def compute_correlation_matrix(enriched, start_date, end_date):
     prices = prices[valid_cols]
     if prices.shape[1] < 2:
         return None
-    returns = np.log(prices / prices.shift(1)).dropna()
-    corr_matrix = returns.corr()
-    cov_matrix = returns.cov() * 252
-    ann_vol = returns.std() * np.sqrt(252)
+    # Compute returns without row-wise dropna so tickers from different exchange
+    # calendars don't wipe each other's data.  Pairwise min_periods=60 ensures
+    # each (ticker, ticker) pair uses only the days when both actually traded.
+    returns     = np.log(prices / prices.shift(1))        # NaN rows kept
+    corr_matrix = returns.corr(min_periods=60)            # pairwise, NaN-safe
+    ann_vol     = returns.std() * np.sqrt(252)            # per-column, NaN-safe
+
+    # Portfolio risk math (w @ Cov @ w) requires a fully populated covariance matrix.
+    # Drop any ticker whose covariance column still contains NaN after pairwise
+    # computation — this means it shares fewer than 60 trading days with at least
+    # one peer (e.g. a non-EUR exchange with a very different market calendar).
+    cov_full     = returns.cov(min_periods=60) * 252
+    risk_tickers = [c for c in cov_full.columns if cov_full[c].notna().all()]
+    excluded     = set(cov_full.columns) - set(risk_tickers)
+    if excluded:
+        print(f"   Excluded from risk contribution (insufficient data overlap): "
+              f"{', '.join(str(e) for e in sorted(excluded))}")
+    cov_matrix = cov_full.loc[risk_tickers, risk_tickers]
+
     equity_total = sum(p["market_value_eur"] for p in enriched)
     ticker_to_weight = {p["ticker"]: p["market_value_eur"] / equity_total
-                        for p in enriched if p["ticker"] in valid_cols}
+                        for p in enriched if p["ticker"] in risk_tickers}
     ordered_tickers = list(cov_matrix.columns)
     w = np.array([ticker_to_weight.get(t, 0) for t in ordered_tickers])
     w = w / w.sum()
@@ -595,7 +695,7 @@ def compute_correlation_matrix(enriched, start_date, end_date):
     mcr = (cov_matrix.values @ w) / port_vol
     ctr = w * mcr
     pct_ctr = ctr / port_vol * 100
-    trading_days = returns.shape[0]
+    trading_days = int(returns.count().median())   # typical per-ticker non-NaN count
     print(f"   Computed from {trading_days} trading days")
     print(f"   Annualized portfolio volatility: {port_vol * 100:.1f}%\n")
     return {
