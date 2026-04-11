@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Lightweight Portfolio Analyzer
-Supports Saxo Bank / Mandatum Trader PDF reports and a universal CSV format.
+Supports Saxo Bank / Mandatum Trader PDF reports, Nordnet PDF reports,
+Nordea XLSX exports, and a universal CSV format.
 Enriches with Yahoo Finance for live prices, sector, geography, and correlation.
 
 Usage:
   python portfolio_analyzer.py Portfolio_report.pdf
+  python portfolio_analyzer.py Salkkuraportti.pdf
   python portfolio_analyzer.py portfolio.csv
   python portfolio_analyzer.py                       (auto-detects Portfolio_*.pdf/csv)
 """
@@ -289,7 +291,99 @@ class NordeaXlsxParser(PortfolioParser):
         return {"positions": positions, "cash_eur": cash_eur, "account_value_eur": account_value}
 
 
-PARSERS: list[PortfolioParser] = [SaxoParser(), NordeaXlsxParser(), CsvParser()]
+class NordnetPdfParser(PortfolioParser):
+    """Parses Nordnet portfolio PDF reports (Salkkuraportti / Portfolio report).
+
+    Columns in the holdings section:
+      Name  MarketPrice+CCY  CostPrice  Qty  MarketValueEUR  UnrealizedResult  Weight%
+    """
+
+    # Currencies Nordnet reports are likely to contain
+    _CURRENCIES = r"EUR|USD|DKK|NOK|SEK|GBP|CHF"
+
+    # One holding row – parsed left-to-right, anchored at both ends.
+    # The name is non-greedy so it stops at the first digits+currency token.
+    _ROW_RE = re.compile(
+        r"^(.+?)\s+"                                         # 1: instrument name
+        r"([\d,]+)(" + r"EUR|USD|DKK|NOK|SEK|GBP|CHF" + r")\s+"  # 2: market price, 3: currency
+        r"([\d,]+)\s+"                                       # 4: cost / avg buy price
+        r"([\d,]+)\s+"                                       # 5: quantity (may be fractional)
+        r"([\d ]+,\d{2})\s+"                                 # 6: market value in EUR
+        r"([+\-\u2212][\d ,]+,\d{2})\s+"                    # 7: unrealised result
+        r"([\d,]+)%$"                                        # 8: portfolio weight
+    )
+
+    @staticmethod
+    def _pn(s: str) -> float:
+        """Parse a Finnish-formatted number (comma decimal, space thousands, U+2212 minus)."""
+        return float(
+            s.strip()
+            .replace("\u2212", "-")   # Finnish minus → ASCII hyphen
+            .replace("\u00a0", "")    # non-breaking space
+            .replace(" ", "")
+            .replace(",", ".")
+        )
+
+    def can_parse(self, path: str) -> bool:
+        if Path(path).suffix.lower() != ".pdf":
+            return False
+        if pdfplumber is None:
+            return False
+        try:
+            with pdfplumber.open(path) as pdf:
+                text = (pdf.pages[0].extract_text() or "").lower()
+            return "nordnet" in text
+        except Exception:
+            return False
+
+    def parse(self, path: str) -> dict:
+        if pdfplumber is None:
+            print("pdfplumber not installed. Run: pip install pdfplumber")
+            sys.exit(1)
+
+        print(f"Parsing {path}...")
+
+        with pdfplumber.open(path) as pdf:
+            full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+        positions = []
+        for line in full_text.splitlines():
+            m = self._ROW_RE.match(line.strip())
+            if not m:
+                continue
+            name, mkt_price, ccy, cost_price, qty, mkt_val, result, _ = m.groups()
+            positions.append({
+                "instrument": name.strip(),
+                "isin": "",           # not present in Nordnet PDF export
+                "currency": ccy,
+                "quantity": self._pn(qty),
+                "open_price": self._pn(cost_price),
+                "current_price": self._pn(mkt_price),
+                "pnl_eur": self._pn(result),
+                "market_value_eur": self._pn(mkt_val),
+            })
+
+        # Cash: "Likvidit varat  142,66  0,47%"
+        cash_eur = 0.0
+        cash_m = re.search(r"Likvidit varat\s+([\d ,]+,\d{2})\s+[\d,]+%", full_text)
+        if cash_m:
+            cash_eur = self._pn(cash_m.group(1))
+
+        # Account total: "Yhteensä  30 639,69  +8 815,30  100,00%"
+        total_m = re.search(r"Yhteens[äa]\s+([\d ,]+,\d{2})\s+[+\-\u2212]", full_text)
+        if total_m:
+            account_value = self._pn(total_m.group(1))
+        else:
+            account_value = sum(p["market_value_eur"] for p in positions) + cash_eur
+
+        print(f"   Extracted {len(positions)} positions")
+        print(f"   Cash: EUR {cash_eur:,.2f}")
+        print(f"   Account value: EUR {account_value:,.2f}\n")
+
+        return {"positions": positions, "cash_eur": cash_eur, "account_value_eur": account_value}
+
+
+PARSERS: list[PortfolioParser] = [NordnetPdfParser(), SaxoParser(), NordeaXlsxParser(), CsvParser()]
 
 
 def load_portfolio(path: str) -> dict:
@@ -298,7 +392,8 @@ def load_portfolio(path: str) -> dict:
             return parser.parse(path)
     raise ValueError(
         f"No parser recognised '{path}'. "
-        f"Supported formats: Saxo Bank / Mandatum PDF, CSV."
+        f"Supported formats: Nordnet PDF (Salkkuraportti), "
+        f"Saxo Bank / Mandatum Trader PDF, Nordea XLSX (Omistukset.xlsx), CSV."
     )
 
 
