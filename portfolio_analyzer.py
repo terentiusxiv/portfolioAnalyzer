@@ -53,7 +53,7 @@ DEFAULT_ISIN_MAP = {
     "US5128073062": "LRCX",
     "FI4000552526": "MANTA.HE",
     "FI4000198031": "QTCOM.HE",
-    "FI0009010912": "REV1V.HE",
+    "FI0009010912": "REG1V.HE",   # Revenio Group — ticker changed from REV1V to REG1V
     "US92532F1003": "VRTX",
 }
 
@@ -572,28 +572,51 @@ def resolve_tickers(positions, isin_map):
 
 def enrich_positions(positions, isin_map):
     print("Fetching data from Yahoo Finance...")
-    enriched = []
+    enriched   = []
+    needs_save = False
     for pos in positions:
         map_key = pos["isin"] if pos["isin"] else f"NAME:{pos['instrument']}"
-        ticker = isin_map.get(map_key)
+        ticker  = isin_map.get(map_key)
         if not ticker:
             continue
+
         try:
             info = yf.Ticker(ticker).info
-            enriched.append({
-                **pos, "ticker": ticker,
-                "sector": info.get("sector", "Unknown"),
-                "country": info.get("country", "Unknown"),
-                "industry": info.get("industry", "Unknown"),
-                "full_name": info.get("longName") or info.get("shortName", pos["instrument"]),
-            })
+            if not info:                        # empty dict → delisted / renamed
+                raise ValueError("empty response")
         except Exception as e:
-            print(f"   Warning: Failed {ticker}: {e}")
-            enriched.append({
-                **pos, "ticker": ticker,
-                "sector": "Unknown", "country": "Unknown",
-                "industry": "Unknown", "full_name": pos["instrument"],
-            })
+            # Ticker appears stale — try to find the current symbol by instrument name
+            new_symbol, exch = _search_yf_ticker(pos["instrument"])
+            if new_symbol and new_symbol != ticker:
+                print(f"   \u26a0  {ticker} appears stale \u2014 re-resolved to "
+                      f"{new_symbol} ({exch}); updating cache")
+                isin_map[map_key] = new_symbol
+                needs_save = True
+                ticker = new_symbol
+                try:
+                    info = yf.Ticker(new_symbol).info
+                except Exception:
+                    info = {}
+            else:
+                print(f"   Warning: Failed to fetch data for {ticker}: {e}")
+                enriched.append({
+                    **pos, "ticker": ticker,
+                    "sector": "Unknown", "country": "Unknown",
+                    "industry": "Unknown", "full_name": pos["instrument"],
+                })
+                continue
+
+        enriched.append({
+            **pos, "ticker": ticker,
+            "sector":    info.get("sector",   "Unknown"),
+            "country":   info.get("country",  "Unknown"),
+            "industry":  info.get("industry", "Unknown"),
+            "full_name": info.get("longName") or info.get("shortName", pos["instrument"]),
+        })
+
+    if needs_save:
+        save_isin_map(isin_map)
+        print(f"   Updated {ISIN_TICKER_MAP_FILE} with re-resolved tickers")
     print(f"   Enriched {len(enriched)} positions\n")
     return enriched
 
@@ -677,12 +700,14 @@ def compute_correlation_matrix(enriched, start_date, end_date):
     # computation — this means it shares fewer than 60 trading days with at least
     # one peer (e.g. a non-EUR exchange with a very different market calendar).
     cov_full     = returns.cov(min_periods=60) * 252
-    risk_tickers = [c for c in cov_full.columns if cov_full[c].notna().all()]
+    risk_tickers = [c for c in corr_matrix.columns if corr_matrix[c].notna().all()]
     excluded     = set(cov_full.columns) - set(risk_tickers)
     if excluded:
         print(f"   Excluded from risk contribution (insufficient data overlap): "
               f"{', '.join(str(e) for e in sorted(excluded))}")
-    cov_matrix = cov_full.loc[risk_tickers, risk_tickers]
+    cov_matrix  = cov_full.loc[risk_tickers, risk_tickers]
+    corr_matrix = corr_matrix.loc[risk_tickers, risk_tickers]
+    ann_vol     = ann_vol[risk_tickers]
 
     equity_total = sum(p["market_value_eur"] for p in enriched)
     ticker_to_weight = {p["ticker"]: p["market_value_eur"] / equity_total
