@@ -53,7 +53,7 @@ DEFAULT_ISIN_MAP = {
     "US5128073062": "LRCX",
     "FI4000552526": "MANTA.HE",
     "FI4000198031": "QTCOM.HE",
-    "FI0009010912": "REV1V.HE",
+    "FI0009010912": "REG1V.HE",   # Revenio Group — ticker changed from REV1V to REG1V
     "US92532F1003": "VRTX",
 }
 
@@ -88,7 +88,7 @@ class SaxoParser(PortfolioParser):
                 text = (pdf.pages[0].extract_text() or "").lower()
             return "saxo" in text or "mandatum" in text
         except Exception:
-            return True  # Accept any PDF as a fallback
+            return False  # Can't read PDF → not a Saxo report
 
     def parse(self, path: str) -> dict:
         if pdfplumber is None:
@@ -214,7 +214,7 @@ class CsvParser(PortfolioParser):
                 "instrument": instrument,
                 "isin": isin,
                 "currency": str(row["currency"]).strip(),
-                "quantity": int(row["quantity"]),
+                "quantity": float(row["quantity"]),
                 "open_price": float(row["open_price"]),
                 "current_price": float(row["current_price"]),
                 "pnl_eur": float(row["pnl_eur"]),
@@ -459,56 +459,163 @@ def _fetch_openfigi_ticker(isin: str, timeout: int = 4) -> str | None:
         return None
 
 
+# Preferred Yahoo Finance exchange codes for name-based ticker selection.
+# Primary sort key is still the search score; this list breaks ties in favour of
+# liquid, EUR-friendly exchanges over peripheral or non-EUR venues (e.g. Swiss CHF).
+_YF_EXCHANGE_PREFERENCE = [
+    "NMS", "NYQ", "NCM", "NGM",   # US — NASDAQ / NYSE variants
+    "HEL",                          # Helsinki
+    "GER", "FRA",                   # Frankfurt / XETRA
+    "AMS",                          # Amsterdam
+    "MIL",                          # Milan
+    "PAR",                          # Paris
+    "STO",                          # Stockholm
+    "CPH",                          # Copenhagen
+    "OSL",                          # Oslo
+    "ISE",                          # Ireland
+]
+
+
+def _search_yf_ticker(name: str) -> tuple[str | None, str | None]:
+    """Search Yahoo Finance by instrument name.
+
+    Returns (symbol, exchange_label) for the best-scoring equity/ETF/fund result,
+    or (None, None) if nothing was found.  The symbol already contains the correct
+    Yahoo Finance exchange suffix (e.g. 'SIILI.HE', 'NVDA'), so no further mapping
+    is needed.
+
+    When multiple results share the same score, the entry whose exchange appears
+    earliest in _YF_EXCHANGE_PREFERENCE wins, avoiding peripheral (e.g. CHF-listed)
+    cross-listings for EUR-based portfolios.
+    """
+    def _exchange_rank(r: dict) -> int:
+        try:
+            return _YF_EXCHANGE_PREFERENCE.index(r.get("exchange", ""))
+        except ValueError:
+            return len(_YF_EXCHANGE_PREFERENCE)   # unlisted exchanges go last
+
+    try:
+        results = yf.Search(name, max_results=8).quotes
+        if not results:
+            return None, None
+        candidates = [
+            r for r in results
+            if r.get("quoteType") in ("EQUITY", "ETF", "MUTUALFUND")
+        ] or results
+        best = min(candidates, key=lambda r: (-r.get("score", 0), _exchange_rank(r)))
+        label = best.get("exchDisp") or best.get("exchange") or ""
+        return best.get("symbol"), label
+    except Exception:
+        return None, None
+
+
 def resolve_tickers(positions, isin_map):
     updated = dict(isin_map)
-    unmapped = [(p["instrument"], p["isin"]) for p in positions if p["isin"] not in updated]
-    if unmapped:
+
+    def _map_key(p):
+        return p["isin"] if p["isin"] else f"NAME:{p['instrument']}"
+
+    unmapped = [(p["instrument"], _map_key(p)) for p in positions if _map_key(p) not in updated]
+    if not unmapped:
+        save_isin_map(updated)
+        return updated
+
+    # ── Name-based positions (no ISIN): auto-resolve via Yahoo Finance search ──
+    name_based = [(n, k) for n, k in unmapped if k.startswith("NAME:")]
+    isin_based  = [(n, k) for n, k in unmapped if not k.startswith("NAME:")]
+
+    if name_based:
+        print(f"Auto-resolving {len(name_based)} name-based positions via Yahoo Finance...")
+        unresolved = []
+        for name, map_key in name_based:
+            symbol, exch = _search_yf_ticker(name)
+            if symbol:
+                updated[map_key] = symbol
+                print(f"   {name:<48} → {symbol:<12} ({exch})")
+            else:
+                unresolved.append((name, map_key))
+        print()
+
+        if unresolved:
+            print("Could not auto-resolve — enter ticker or '-' to skip:")
+            for name, map_key in unresolved:
+                user_input = input(f"  {name} -> ").strip()
+                if user_input and user_input != "-":
+                    updated[map_key] = user_input
+            print()
+
+    # ── ISIN-based positions: interactive flow with OpenFIGI suggestions ──
+    if isin_based:
         print("--- Unmapped ISINs ---")
         print("Suggestions from OpenFIGI shown where available.")
-        print("Press Enter to accept a suggestion, type to override, or leave blank to skip.\n")
-        for name, isin in unmapped:
-            suggestion = _fetch_openfigi_ticker(isin)
+        print("Press Enter to accept, type to override, or '-' to skip.\n")
+        for name, map_key in isin_based:
+            suggestion = _fetch_openfigi_ticker(map_key)
             if suggestion:
-                prompt = f"  {name} ({isin})\n  Suggestion: {suggestion}\n  Accept [Enter], override with ticker, or '-' to skip: "
+                prompt = f"  {name} ({map_key})\n  Suggestion: {suggestion}\n  Accept [Enter], override, or '-' to skip: "
             else:
-                prompt = f"  {name} ({isin}) -> "
+                prompt = f"  {name} ({map_key}) -> "
             user_input = input(prompt).strip()
             if suggestion:
                 ticker = None if user_input == "-" else (user_input or suggestion)
             else:
                 ticker = user_input or None
             if ticker:
-                updated[isin] = ticker
-        save_isin_map(updated)
-        print(f"\n   Saved to {ISIN_TICKER_MAP_FILE}\n")
-    elif not Path(ISIN_TICKER_MAP_FILE).exists():
-        save_isin_map(updated)
+                updated[map_key] = ticker
+        print()
+
+    save_isin_map(updated)
+    print(f"   Saved to {ISIN_TICKER_MAP_FILE}\n")
     return updated
 
 
 def enrich_positions(positions, isin_map):
     print("Fetching data from Yahoo Finance...")
-    enriched = []
+    enriched   = []
+    needs_save = False
     for pos in positions:
-        ticker = isin_map.get(pos["isin"])
+        map_key = pos["isin"] if pos["isin"] else f"NAME:{pos['instrument']}"
+        ticker  = isin_map.get(map_key)
         if not ticker:
             continue
+
         try:
             info = yf.Ticker(ticker).info
-            enriched.append({
-                **pos, "ticker": ticker,
-                "sector": info.get("sector", "Unknown"),
-                "country": info.get("country", "Unknown"),
-                "industry": info.get("industry", "Unknown"),
-                "full_name": info.get("longName") or info.get("shortName", pos["instrument"]),
-            })
+            if not info:                        # empty dict → delisted / renamed
+                raise ValueError("empty response")
         except Exception as e:
-            print(f"   Warning: Failed {ticker}: {e}")
-            enriched.append({
-                **pos, "ticker": ticker,
-                "sector": "Unknown", "country": "Unknown",
-                "industry": "Unknown", "full_name": pos["instrument"],
-            })
+            # Ticker appears stale — try to find the current symbol by instrument name
+            new_symbol, exch = _search_yf_ticker(pos["instrument"])
+            if new_symbol and new_symbol != ticker:
+                print(f"   \u26a0  {ticker} appears stale \u2014 re-resolved to "
+                      f"{new_symbol} ({exch}); updating cache")
+                isin_map[map_key] = new_symbol
+                needs_save = True
+                ticker = new_symbol
+                try:
+                    info = yf.Ticker(new_symbol).info
+                except Exception:
+                    info = {}
+            else:
+                print(f"   Warning: Failed to fetch data for {ticker}: {e}")
+                enriched.append({
+                    **pos, "ticker": ticker,
+                    "sector": "Unknown", "country": "Unknown",
+                    "industry": "Unknown", "full_name": pos["instrument"],
+                })
+                continue
+
+        enriched.append({
+            **pos, "ticker": ticker,
+            "sector":    info.get("sector",   "Unknown"),
+            "country":   info.get("country",  "Unknown"),
+            "industry":  info.get("industry", "Unknown"),
+            "full_name": info.get("longName") or info.get("shortName", pos["instrument"]),
+        })
+
+    if needs_save:
+        save_isin_map(isin_map)
+        print(f"   Updated {ISIN_TICKER_MAP_FILE} with re-resolved tickers")
     print(f"   Enriched {len(enriched)} positions\n")
     return enriched
 
@@ -525,9 +632,9 @@ def analyze_allocation(enriched, cash_eur):
         "total_portfolio_eur": total_portfolio, "total_equity_eur": total_equity,
         "cash_eur": cash_eur,
         "cash_pct": cash_eur / total_portfolio * 100 if total_portfolio else 0,
-        "sector": {k: {"value_eur": v, "pct": v / total_equity * 100}
+        "sector": {k: {"value_eur": v, "pct": v / total_equity * 100 if total_equity else 0}
                    for k, v in sorted(sector_alloc.items(), key=lambda x: -x[1])},
-        "geography": {k: {"value_eur": v, "pct": v / total_equity * 100}
+        "geography": {k: {"value_eur": v, "pct": v / total_equity * 100 if total_equity else 0}
                       for k, v in sorted(geo_alloc.items(), key=lambda x: -x[1])},
     }
 
@@ -580,13 +687,30 @@ def compute_correlation_matrix(enriched, start_date, end_date):
     prices = prices[valid_cols]
     if prices.shape[1] < 2:
         return None
-    returns = np.log(prices / prices.shift(1)).dropna()
-    corr_matrix = returns.corr()
-    cov_matrix = returns.cov() * 252
-    ann_vol = returns.std() * np.sqrt(252)
+    # Compute returns without row-wise dropna so tickers from different exchange
+    # calendars don't wipe each other's data.  Pairwise min_periods=60 ensures
+    # each (ticker, ticker) pair uses only the days when both actually traded.
+    returns     = np.log(prices / prices.shift(1))        # NaN rows kept
+    corr_matrix = returns.corr(min_periods=60)            # pairwise, NaN-safe
+    ann_vol     = returns.std() * np.sqrt(252)            # per-column, NaN-safe
+
+    # Portfolio risk math (w @ Cov @ w) requires a fully populated covariance matrix.
+    # Drop any ticker whose covariance column still contains NaN after pairwise
+    # computation — this means it shares fewer than 60 trading days with at least
+    # one peer (e.g. a non-EUR exchange with a very different market calendar).
+    cov_full     = returns.cov(min_periods=60) * 252
+    risk_tickers = [c for c in corr_matrix.columns if corr_matrix[c].notna().all()]
+    excluded     = set(cov_full.columns) - set(risk_tickers)
+    if excluded:
+        print(f"   Excluded from risk contribution (insufficient data overlap): "
+              f"{', '.join(str(e) for e in sorted(excluded))}")
+    cov_matrix  = cov_full.loc[risk_tickers, risk_tickers]
+    corr_matrix = corr_matrix.loc[risk_tickers, risk_tickers]
+    ann_vol     = ann_vol[risk_tickers]
+
     equity_total = sum(p["market_value_eur"] for p in enriched)
     ticker_to_weight = {p["ticker"]: p["market_value_eur"] / equity_total
-                        for p in enriched if p["ticker"] in valid_cols}
+                        for p in enriched if p["ticker"] in risk_tickers}
     ordered_tickers = list(cov_matrix.columns)
     w = np.array([ticker_to_weight.get(t, 0) for t in ordered_tickers])
     w = w / w.sum()
@@ -595,7 +719,7 @@ def compute_correlation_matrix(enriched, start_date, end_date):
     mcr = (cov_matrix.values @ w) / port_vol
     ctr = w * mcr
     pct_ctr = ctr / port_vol * 100
-    trading_days = returns.shape[0]
+    trading_days = int(returns.count().median())   # typical per-ticker non-NaN count
     print(f"   Computed from {trading_days} trading days")
     print(f"   Annualized portfolio volatility: {port_vol * 100:.1f}%\n")
     return {
@@ -878,6 +1002,9 @@ def pick_stocks(candidates, corr_data, enriched, test_weight=0.05, start_date=No
 
     for ticker in expanded_data["candidate_tickers"]:
         valid_existing = [t for t in existing_tickers if t in combined.columns]
+        if not valid_existing:
+            print(f"   Skipping {ticker}: no overlapping holdings in price data")
+            continue
         pair_corrs = {t: combined[ticker].corr(combined[t]) for t in valid_existing}
         avg_corr = float(np.mean(list(pair_corrs.values())))
         max_corr_ticker = max(pair_corrs, key=pair_corrs.get)
@@ -885,6 +1012,9 @@ def pick_stocks(candidates, corr_data, enriched, test_weight=0.05, start_date=No
 
         sim_cov = combined[valid_existing + [ticker]].cov() * 252
         total_w = sum(corr_data["weights"][existing_tickers.index(t)] for t in valid_existing)
+        if total_w == 0:
+            print(f"   Skipping {ticker}: zero weight in valid existing tickers")
+            continue
         sim_w = np.array(
             [corr_data["weights"][existing_tickers.index(t)] / total_w * (1 - test_weight)
              for t in valid_existing]
